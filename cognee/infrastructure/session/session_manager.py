@@ -987,6 +987,40 @@ class SessionManager:
             )
             return False
 
+    async def increment_session_context_entry(
+        self,
+        *,
+        user_id: str,
+        entry_id: str,
+        increments: dict,
+        session_id: str | None = None,
+    ) -> bool:
+        """
+        Atomically add integer deltas to numeric fields of the session-context entry
+        matching entry["id"]. Use this for counts: an absolute-value merge of a count
+        read outside the write lock loses concurrent increments.
+
+        Raises SessionParameterValidationError for invalid user_id/session_id.
+        Fail-open on infrastructure errors: returns False when the cache is
+        unavailable or the cache operation fails.
+        """
+        session_id = self.resolve_session_id(session_id)
+        self._validate_session_params(user_id=user_id, session_id=session_id)
+        if not self.is_available:
+            logger.debug(
+                "SessionManager: cache unavailable, skipping increment_session_context_entry"
+            )
+            return False
+        try:
+            return await self._cache.increment_session_context_entry(
+                user_id, session_id, entry_id, increments
+            )
+        except Exception as e:
+            logger.warning(
+                "SessionManager: increment_session_context_entry failed: %s", e, exc_info=True
+            )
+            return False
+
     async def delete_session_context_entry(
         self,
         *,

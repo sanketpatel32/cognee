@@ -23,6 +23,28 @@ def _escape_glob(text: str) -> str:
     return "".join("\\" + char if char in "*?[]\\" else char for char in text)
 
 
+# Atomic read-modify-write of one entry in a session-context list: find the entry
+# whose id is ARGV[1], add the numeric deltas of the JSON object in ARGV[2] to its
+# fields, and LSET it back. Redis runs the whole script atomically, so concurrent
+# increments cannot lose one another the way a client-side read-merge-write does.
+_INCREMENT_SESSION_CONTEXT_SCRIPT = """
+local len = redis.call('LLEN', KEYS[1])
+local increments = cjson.decode(ARGV[2])
+for i = 0, len - 1 do
+  local raw = redis.call('LINDEX', KEYS[1], i)
+  local entry = cjson.decode(raw)
+  if entry['id'] == ARGV[1] then
+    for field_name, delta in pairs(increments) do
+      entry[field_name] = (tonumber(entry[field_name]) or 0) + delta
+    end
+    redis.call('LSET', KEYS[1], i, cjson.encode(entry))
+    return 1
+  end
+end
+return 0
+"""
+
+
 class RedisAdapter(CacheDBInterface):
     """Redis-backed cache adapter for session QA, trace storage, and coordination."""
 
@@ -734,6 +756,32 @@ class RedisAdapter(CacheDBInterface):
             raise CacheConnectionError(error_msg) from e
         except Exception as e:
             error_msg = f"Unexpected error while updating session context in Redis: {e!s}"
+            logger.error(error_msg)
+            raise CacheConnectionError(error_msg) from e
+
+    async def increment_session_context_entry(
+        self, user_id: str, session_id: str, entry_id: str, increments: dict
+    ) -> bool:
+        """Add integer deltas to numeric fields of the entry matching entry["id"].
+
+        Runs as one Lua script so the read and the write cannot interleave with
+        another increment — Redis executes a script atomically. An absolute-value
+        merge of a count read earlier loses whichever rating lands second.
+        """
+        try:
+            context_key = self._session_context_key(user_id, session_id)
+            updated = await self.async_redis.eval(
+                _INCREMENT_SESSION_CONTEXT_SCRIPT, 1, context_key, entry_id, json.dumps(increments)
+            )
+            if updated:
+                await self._apply_session_ttl(context_key)
+            return bool(updated)
+        except (redis.ConnectionError, redis.TimeoutError) as e:
+            error_msg = f"Redis connection error while incrementing session context: {e!s}"
+            logger.error(error_msg)
+            raise CacheConnectionError(error_msg) from e
+        except Exception as e:
+            error_msg = f"Unexpected error while incrementing session context in Redis: {e!s}"
             logger.error(error_msg)
             raise CacheConnectionError(error_msg) from e
 

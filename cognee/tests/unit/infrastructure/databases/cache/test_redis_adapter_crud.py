@@ -1,6 +1,7 @@
 """Unit tests for RedisAdapter CRUD operations."""
 
 import asyncio
+import json
 import re
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -44,6 +45,21 @@ class _InMemoryRedisList:
 
     async def lset(self, key: str, idx: int, val: str):
         self.data[key][idx] = val
+
+    async def eval(self, script: str, numkeys: int, *keys_and_args):
+        """Semantic emulation of the session-context increment script: one uninterruptible
+        read-modify-write, as a Lua script executes in Redis."""
+        key, entry_id, increments_json = keys_and_args
+        increments = json.loads(increments_json)
+        lst = self.data.get(key, [])
+        for i, raw in enumerate(lst):
+            entry = json.loads(raw)
+            if entry.get("id") == entry_id:
+                for field_name, delta in increments.items():
+                    entry[field_name] = int(entry.get(field_name) or 0) + delta
+                lst[i] = json.dumps(entry)
+                return 1
+        return 0
 
     async def lrem(self, key: str, count: int, val: str):
         """Only count=0, every occurrence, is used; an emptied list disappears as in Redis."""
@@ -786,6 +802,46 @@ def _interleave(redis_store):
 
     for name in ("lrange", "lrem", "lset", "rpush", "delete", "expire"):
         setattr(redis_store, name, interleaved(getattr(redis_store, name)))
+
+
+@pytest.mark.asyncio
+async def test_increment_session_context_entry_adds_deltas(adapter):
+    """increment adds to numeric fields, creating them when absent."""
+    await adapter.create_session_context_entry("u1", "s1", {"id": "c1", "helpful_count": 2})
+    assert (
+        await adapter.increment_session_context_entry("u1", "s1", "c1", {"helpful_count": 1})
+        is True
+    )
+    assert (
+        await adapter.increment_session_context_entry("u1", "s1", "c1", {"harmful_count": 1})
+        is True
+    )
+    (entry,) = await adapter.get_session_context_entries("u1", "s1")
+    assert entry["helpful_count"] == 3
+    assert entry["harmful_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_increment_session_context_entry_missing_returns_false(adapter):
+    await adapter.create_session_context_entry("u1", "s1", {"id": "c1"})
+    assert (
+        await adapter.increment_session_context_entry("u1", "s1", "ghost", {"helpful_count": 1})
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_increments_both_apply(adapter):
+    """The increment is one atomic script, so no rating is lost whichever lands second."""
+    await adapter.create_session_context_entry("u1", "s1", {"id": "c1", "helpful_count": 0})
+
+    await asyncio.gather(
+        adapter.increment_session_context_entry("u1", "s1", "c1", {"helpful_count": 1}),
+        adapter.increment_session_context_entry("u1", "s1", "c1", {"helpful_count": 1}),
+    )
+
+    (entry,) = await adapter.get_session_context_entries("u1", "s1")
+    assert entry["helpful_count"] == 2
 
 
 def _after_first_read(redis_store, write):

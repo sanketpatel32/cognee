@@ -311,37 +311,32 @@ async def apply_served_context_ratings(
         entries = await session_manager.get_session_context_entries(
             user_id=user_id, session_id=session_id
         )
-        counts = {}
+        # The pre-read filters ratable entries by kind; an entry's kind never changes,
+        # so it need not be race-free. The counts themselves are NOT read here: the
+        # increment is atomic in the cache adapter, so two turns rating the same
+        # entry at the same time both apply — an absolute merge of a count read
+        # outside the write lock loses whichever rating lands second.
+        context_ids = set()
         for raw in entries or []:
             row = raw if isinstance(raw, dict) else getattr(raw, "__dict__", {})
             if row.get("kind", "context") != "context":
                 continue
             entry_id = row.get("id")
             if entry_id is not None:
-                counts[str(entry_id)] = (
-                    int(row.get("helpful_count", 0) or 0),
-                    int(row.get("harmful_count", 0) or 0),
-                )
+                context_ids.add(str(entry_id))
         for rating in ratings:
             try:
                 entry_id = str(getattr(rating, "entry_id", None) or "")
                 verdict = str(getattr(rating, "rating", "") or "").strip().lower()
-                if entry_id not in counts or verdict not in ("helpful", "harmful"):
+                if entry_id not in context_ids or verdict not in ("helpful", "harmful"):
                     continue
-                helpful, harmful = counts[entry_id]
-                if verdict == "helpful":
-                    merge = {"helpful_count": helpful + 1}
-                    next_counts = (helpful + 1, harmful)
-                else:
-                    merge = {"harmful_count": harmful + 1}
-                    next_counts = (helpful, harmful + 1)
-                await session_manager.update_session_context_entry(
+                increments = {"helpful_count": 1} if verdict == "helpful" else {"harmful_count": 1}
+                await session_manager.increment_session_context_entry(
                     user_id=user_id,
                     entry_id=entry_id,
-                    merge=merge,
+                    increments=increments,
                     session_id=session_id,
                 )
-                counts[entry_id] = next_counts
             except Exception:
                 logger.debug(
                     "Skipping item after error in apply_served_context_ratings", exc_info=True

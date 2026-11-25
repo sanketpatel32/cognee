@@ -57,6 +57,16 @@ logger = get_logger("SqlCacheAdapter")
 # Attempts for write transactions that can deadlock under concurrent workers.
 _DEADLOCK_ATTEMPTS = 3
 
+# Process-local write mutexes for the SQLite-family engines, keyed by connection
+# string so every adapter instance over one database file shares one lock. SQLite
+# serializes writers database-wide only once they write: a read-modify-write in a
+# deferred transaction can interleave before the first write statement, so two
+# concurrent increments both read the same count and one is lost. Postgres does
+# not need this — its advisory lock and FOR UPDATE row lock serialize across
+# processes — and multi-process writes to one embedded SQLite file are outside
+# what the embedded backend serves.
+_SQLITE_WRITE_MUTEXES: dict[str, asyncio.Lock] = {}
+
 # Advisory-lock id guarding the throttled global TTL sweep on Postgres.
 _PURGE_LOCK_ID = int.from_bytes(sha256(b"cognee_cache_ttl_sweep").digest()[:8], "big", signed=True)
 
@@ -136,6 +146,10 @@ class SqlCacheAdapter(CacheDBInterface):
         try:
             url = make_url(connection_string)
             self._is_postgres = url.get_backend_name() == "postgresql"
+            if not self._is_postgres:
+                self._write_mutex = _SQLITE_WRITE_MUTEXES.setdefault(
+                    connection_string, asyncio.Lock()
+                )
 
             is_sqlite = url.get_backend_name() == "sqlite"
             # Turso uses the sqlite dialect through cognee's own driver; it needs its
@@ -1090,7 +1104,49 @@ class SqlCacheAdapter(CacheDBInterface):
 
         Returns True if a matching entry was updated, False otherwise.
         """
+        return await self._mutate_session_context_entry(
+            user_id, session_id, entry_id, lambda payload: {**payload, **merge}
+        )
+
+    async def increment_session_context_entry(
+        self, user_id: str, session_id: str, entry_id: str, increments: dict
+    ) -> bool:
+        """Add integer deltas to numeric fields of the entry whose id is ``entry_id``.
+
+        The read and the write are one row-locked transaction, so two concurrent
+        increments both apply — an absolute-value merge of a count read earlier
+        loses whichever rating lands second.
+
+        Returns True if a matching entry was updated, False otherwise.
+        """
+
+        def add_deltas(payload):
+            updated = dict(payload)
+            for field_name, delta in increments.items():
+                updated[field_name] = int(updated.get(field_name, 0) or 0) + int(delta)
+            return updated
+
+        return await self._mutate_session_context_entry(user_id, session_id, entry_id, add_deltas)
+
+    async def _mutate_session_context_entry(
+        self, user_id: str, session_id: str, entry_id: str, mutate
+    ) -> bool:
+        """Apply ``mutate`` to the payload of one entry inside its row-locked transaction.
+
+        ``mutate`` receives the current payload dict and returns the payload to store.
+        The lock ordering — the per-session advisory lock first, then the FOR UPDATE
+        read — is what serializes concurrent writers across workers, so a mutation that
+        depends on the stored value (an increment) cannot interleave with another.
+        """
         await self._ensure_initialized()
+        if self._is_postgres:
+            return await self._mutate_with_retries(user_id, session_id, entry_id, mutate)
+        async with self._write_mutex:
+            return await self._mutate_with_retries(user_id, session_id, entry_id, mutate)
+
+    async def _mutate_with_retries(
+        self, user_id: str, session_id: str, entry_id: str, mutate
+    ) -> bool:
         attempt = 0
         while True:
             try:
@@ -1102,7 +1158,7 @@ class SqlCacheAdapter(CacheDBInterface):
                     # backfill, resolve to the newest instead of raising
                     # MultipleResultsFound — the permanent per-session 503 of issue
                     # #4226. The UPDATE below still targets every duplicate, so
-                    # stragglers converge on the merged payload.
+                    # stragglers converge on the mutated payload.
                     result = await session.execute(
                         select(cache_session_context.c.payload)
                         .where(
@@ -1117,14 +1173,14 @@ class SqlCacheAdapter(CacheDBInterface):
                     payload = result.scalars().first()
                     if payload is None:
                         return False
-                    merged = {**dict(payload), **merge}
+                    mutated = mutate(dict(payload))
                     await session.execute(
                         update(cache_session_context)
                         .where(
                             self._session_filter(cache_session_context, user_id, session_id),
                             cache_session_context.c.entry_id == entry_id,
                         )
-                        .values(payload=merged)
+                        .values(payload=mutated)
                     )
                     await self._refresh_session_ttl(
                         session, cache_session_context, user_id, session_id

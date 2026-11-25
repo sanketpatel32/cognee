@@ -1001,6 +1001,52 @@ async def test_update_session_context_entry_missing_returns_false(adapter):
 
 
 @pytest.mark.asyncio
+async def test_increment_session_context_entry_adds_deltas(adapter):
+    """increment adds to numeric fields, creating them when absent."""
+    await adapter.create_session_context_entry("u1", "s1", _ctx("c1"))
+    await adapter.update_session_context_entry("u1", "s1", "c1", {"helpful_count": 2})
+    assert (
+        await adapter.increment_session_context_entry("u1", "s1", "c1", {"helpful_count": 1})
+        is True
+    )
+    assert (
+        await adapter.increment_session_context_entry("u1", "s1", "c1", {"harmful_count": 1})
+        is True
+    )
+    (entry,) = await adapter.get_session_context_entries("u1", "s1")
+    assert entry["helpful_count"] == 3
+    assert entry["harmful_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_increment_session_context_entry_missing_returns_false(adapter):
+    await adapter.create_session_context_entry("u1", "s1", _ctx("c1"))
+    assert (
+        await adapter.increment_session_context_entry("u1", "s1", "ghost", {"helpful_count": 1})
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_increments_both_apply(adapter):
+    """The read and the write are one locked transaction, so two increments landing
+    at the same time both apply — the lost-update race of #6820."""
+    import asyncio
+
+    await adapter.create_session_context_entry("u1", "s1", _ctx("c1"))
+
+    await asyncio.gather(
+        *[
+            adapter.increment_session_context_entry("u1", "s1", "c1", {"helpful_count": 1})
+            for _ in range(5)
+        ]
+    )
+
+    (entry,) = await adapter.get_session_context_entries("u1", "s1")
+    assert entry["helpful_count"] == 5
+
+
+@pytest.mark.asyncio
 async def test_delete_session_context_returns_existence(adapter):
     """delete_session_context wipes the list; True only when live rows existed."""
     await adapter.create_session_context_entry("u1", "s1", _ctx("c1"))

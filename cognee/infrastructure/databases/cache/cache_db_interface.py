@@ -336,6 +336,15 @@ class CacheDBInterface(ABC):
         """
 
     @abstractmethod
+    async def increment_session_context_entry(
+        self, user_id: str, session_id: str, entry_id: str, increments: dict
+    ) -> bool:
+        """
+        Atomically add integer deltas to numeric fields of the session-context entry
+        matching entry["id"]. Returns True if updated, False if entry_id not found.
+        """
+
+    @abstractmethod
     async def delete_session_context(self, user_id: str, session_id: str) -> bool:
         """
         Delete the entire session-context list for the given session.
